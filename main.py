@@ -14,80 +14,84 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# ---------------------------
-# Basic file storage settings
-# ---------------------------
-
+# ---------- basic file config ----------
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "/tmp/audio")
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:5000")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-def download_file(url: str, local_path: str) -> str:
-    """Download file from URL to local path."""
-    resp = requests.get(url, stream=True)
+def download_file(url: str, suffix: str = ".wav") -> str:
+    """
+    Download file from remote URL to a temp file path and return the path.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.close()
+    resp = requests.get(url, stream=True, timeout=60)
     resp.raise_for_status()
-    with open(local_path, "wb") as f:
+    with open(tmp.name, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
-    return local_path
+    return tmp.name
 
 
-def save_and_get_url(audio_data: np.ndarray, sr: int, filename: str) -> str:
-    """Save audio to UPLOAD_FOLDER and return public URL."""
+def save_and_get_url(audio: np.ndarray, sr: int, filename: str) -> str:
+    """
+    Save numpy audio array to UPLOAD_FOLDER and return public URL.
+    """
     filepath = os.path.join(UPLOAD_FOLDER, filename)
-
-    # Make sure it's float and not clipping
-    audio = audio_data.astype(np.float32)
-    peak = np.max(np.abs(audio)) + 1e-9
-    if peak > 1.0:
-        audio = audio / peak
-
     sf.write(filepath, audio, sr)
     return f"{BASE_URL}/files/{filename}"
 
 
 @app.route("/files/<path:filename>")
-def serve_file(filename: str):
-    """Serve audio files stored in UPLOAD_FOLDER."""
-    return send_from_directory(UPLOAD_FOLDER, filename)
+def serve_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=False)
 
 
-# ===========================
-# 1. STEM "SEPARATION" (FAKE)
-# ===========================
+# ---------- health ----------
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
+
+# ---------- simple "stem" split (VERY basic, not real AI separation) ----------
 @app.route("/api/separate-stems", methods=["POST"])
 def separate_stems():
     """
-    Placeholder stem separation.
+    Very simple fake stem split so the frontend has something to work with
+    WITHOUT using Spleeter (which doesn't work on Python 3.13).
 
-    For now, we just return the same audio as both 'vocals' and 'instrumental'
-    so the feature works end-to-end without Spleeter.
+    It roughly emphasizes high frequencies as "vocals" and the rest as "instrumental".
+
+    Request JSON:
+      { "audio_url": "https://...", "project_id": "optional" }
     """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True)
         audio_url = data.get("audio_url")
-        project_id = data.get("project_id", str(uuid.uuid4()))
+        project_id = data.get("project_id") or str(uuid.uuid4())
 
         if not audio_url:
             return jsonify({"success": False, "error": "audio_url is required"}), 400
 
-        # Download audio to temp file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            download_file(audio_url, tmp.name)
-            input_path = tmp.name
+        path = download_file(audio_url, suffix=".wav")
+        y, sr = librosa.load(path, sr=44100, mono=True)
 
-        # Load audio
-        y, sr = librosa.load(input_path, sr=44100)
+        # crude "vocal" emphasis using preemphasis (boost high freq)
+        vocals = librosa.effects.preemphasis(y, coef=0.97)
+        # rough "instrumental" as residual
+        instrumental = y - 0.6 * vocals
 
-        # Save two copies with different names
-        vocals_url = save_and_get_url(y, sr, f"{project_id}_vocals.wav")
-        instrumental_url = save_and_get_url(y, sr, f"{project_id}_instrumental.wav")
+        # normalize a bit
+        vocals = vocals / (np.max(np.abs(vocals)) + 1e-9) * 0.95
+        instrumental = instrumental / (np.max(np.abs(instrumental)) + 1e-9) * 0.95
 
-        os.unlink(input_path)
+        vocals_url = save_and_get_url(vocals, sr, f"{project_id}_vocals.wav")
+        instrumental_url = save_and_get_url(instrumental, sr, f"{project_id}_instrumental.wav")
+
+        os.unlink(path)
 
         return jsonify({
             "success": True,
@@ -98,178 +102,221 @@ def separate_stems():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ===========================
-# 2. KEY & BPM DETECTION
-# ===========================
-
+# ---------- key & bpm detection ----------
 @app.route("/api/analyze", methods=["POST"])
 def analyze_audio():
-    """Detect key and BPM of an audio file."""
+    """
+    Detect BPM and musical key from an audio file.
+    Request JSON:
+      { "audio_url": "https://..." }
+    """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True)
         audio_url = data.get("audio_url")
-
         if not audio_url:
             return jsonify({"success": False, "error": "audio_url is required"}), 400
 
-        # Download audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            download_file(audio_url, tmp.name)
-            input_path = tmp.name
+        path = download_file(audio_url, suffix=".wav")
+        y, sr = librosa.load(path, sr=22050, mono=True)
 
-        # Load audio
-        y, sr = librosa.load(input_path, sr=22050)
-
-        # BPM detection
+        # BPM
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = float(tempo[0]) if hasattr(tempo, "__iter__") else float(tempo)
-        bpm = round(bpm)
+        if isinstance(tempo, (list, np.ndarray)):
+            bpm = float(tempo[0])
+        else:
+            bpm = float(tempo)
 
-        # Key detection (simple)
+        # KEY (simple estimate using chroma and Krumhansl profiles)
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        chroma_avg = np.mean(chroma, axis=1)
+        chroma_avg = chroma.mean(axis=1)
 
         key_names = ["C", "C#", "D", "D#", "E", "F",
                      "F#", "G", "G#", "A", "A#", "B"]
-        key_index = int(np.argmax(chroma_avg))
 
-        major_profile = [6.35, 2.23, 3.48, 2.33,
-                         4.38, 4.09, 2.52, 5.19,
-                         2.39, 3.66, 2.29, 2.88]
-        minor_profile = [6.33, 2.68, 3.52, 5.38,
-                         2.60, 3.53, 2.54, 4.75,
-                         3.98, 2.69, 3.34, 3.17]
+        major_profile = np.array(
+            [6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+             2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+        )
+        minor_profile = np.array(
+            [6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+             2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+        )
 
-        major_corr = np.corrcoef(
-            chroma_avg, np.roll(major_profile, key_index)
-        )[0, 1]
-        minor_corr = np.corrcoef(
-            chroma_avg, np.roll(minor_profile, key_index)
-        )[0, 1]
+        best_key = None
+        best_mode = None
+        best_corr = -1.0
 
-        mode = "major" if major_corr > minor_corr else "minor"
-        key = f"{key_names[key_index]} {mode}"
+        for i in range(12):
+            major_corr = np.corrcoef(chroma_avg, np.roll(major_profile, i))[0, 1]
+            minor_corr = np.corrcoef(chroma_avg, np.roll(minor_profile, i))[0, 1]
 
-        os.unlink(input_path)
+            if major_corr > best_corr:
+                best_corr = major_corr
+                best_key = key_names[i]
+                best_mode = "major"
 
-        return jsonify({
-            "success": True,
-            "bpm": bpm,
-            "key": key
-        })
+            if minor_corr > best_corr:
+                best_corr = minor_corr
+                best_key = key_names[i]
+                best_mode = "minor"
+
+        key = f"{best_key} {best_mode}"
+
+        os.unlink(path)
+
+        return jsonify({"success": True, "bpm": round(bpm), "key": key})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ===========================
-# 3. AUTOTUNE (SIMPLE)
-# ===========================
-
+# ---------- simple autotune / pitch correction ----------
 @app.route("/api/autotune", methods=["POST"])
 def autotune_vocals():
-    """Apply simple pitch-based processing to vocals."""
+    """
+    Very simple pitch-correction style effect.
+    This is not pro-level Autotune but gives a tuned / processed sound.
+    Request JSON:
+      {
+        "audio_url": "https://...",
+        "key": "C major",        # optional, default C major
+        "style": "natural|medium|hard",
+        "project_id": "optional-id"
+      }
+    """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True)
         audio_url = data.get("audio_url")
-        style = data.get("style", "medium").lower()  # natural, medium, hard
-        project_id = data.get("project_id", str(uuid.uuid4()))
+        key = (data.get("key") or "C major").strip()
+        style = (data.get("style") or "medium").lower()
+        project_id = data.get("project_id") or str(uuid.uuid4())
 
         if not audio_url:
             return jsonify({"success": False, "error": "audio_url is required"}), 400
 
-        # Download audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            download_file(audio_url, tmp.name)
-            input_path = tmp.name
+        if style not in ["natural", "medium", "hard"]:
+            style = "medium"
 
-        # Load audio
-        y, sr = librosa.load(input_path, sr=44100)
+        path = download_file(audio_url, suffix=".wav")
+        y, sr = librosa.load(path, sr=44100, mono=True)
 
-        if style == "hard":
-            # "Hard" style: more robotic / processed feel
-            y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=0)
-            y_tuned = librosa.effects.harmonic(y_shifted)
+        # estimate fundamental frequency contour
+        f0, voiced_flag, _ = librosa.pyin(
+            y,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7")
+        )
+
+        # build scale from key
+        key_root = key.split()[0].upper()
+        is_minor = "MINOR" in key.upper()
+
+        key_to_midi = {
+            "C": 0, "C#": 1, "DB": 1, "D": 2, "D#": 3, "EB": 3,
+            "E": 4, "F": 5, "F#": 6, "GB": 6, "G": 7, "G#": 8,
+            "AB": 8, "A": 9, "A#": 10, "BB": 10, "B": 11
+        }
+        root = key_to_midi.get(key_root, 0)
+
+        major_scale = [0, 2, 4, 5, 7, 9, 11]
+        minor_scale = [0, 2, 3, 5, 7, 8, 10]
+        scale = minor_scale if is_minor else major_scale
+
+        # All notes in all octaves for the scale
+        scale_midi = []
+        for octave in range(0, 9):
+            for interval in scale:
+                scale_midi.append(root + interval + 12 * octave)
+        scale_midi = np.array(scale_midi)
+
+        # convert f0 to midi
+        f0_midi = librosa.hz_to_midi(f0, offset=0.0)
+        target_f0 = f0.copy()
+
+        # snap each voiced frame to nearest scale note
+        for i, (freq, voiced) in enumerate(zip(f0_midi, voiced_flag)):
+            if not voiced or np.isnan(freq):
+                continue
+            nearest = scale_midi[np.argmin(np.abs(scale_midi - freq))]
+            target_f0[i] = librosa.midi_to_hz(nearest)
+
+        # compute pitch-shift in semitones frame-wise
+        # we will use a single global shift as a simplification
+        valid = (~np.isnan(f0)) & (~np.isnan(target_f0)) & (voiced_flag)
+        if np.any(valid):
+            avg_shift_semitones = np.median(
+                librosa.hz_to_midi(target_f0[valid]) - librosa.hz_to_midi(f0[valid])
+            )
         else:
-            # Gentle processing
-            y_proc = librosa.effects.pitch_shift(y, sr=sr, n_steps=0)
-            strength = {"natural": 0.3, "medium": 0.6}.get(style, 0.6)
-            y_tuned = y_proc * strength + y * (1 - strength)
+            avg_shift_semitones = 0.0
 
-        # Normalize
-        peak = np.max(np.abs(y_tuned)) + 1e-9
-        y_tuned = y_tuned / peak * 0.95
+        # style strength
+        if style == "natural":
+            shift = avg_shift_semitones * 0.4
+        elif style == "medium":
+            shift = avg_shift_semitones * 0.7
+        else:  # hard
+            shift = avg_shift_semitones
 
-        tuned_url = save_and_get_url(y_tuned, sr, f"{project_id}_tuned.wav")
+        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=shift)
 
-        os.unlink(input_path)
+        # slight dynamic range control
+        y_out = y_shifted / (np.max(np.abs(y_shifted)) + 1e-9) * 0.95
+
+        tuned_url = save_and_get_url(y_out, sr, f"{project_id}_tuned.wav")
+
+        os.unlink(path)
 
         return jsonify({"success": True, "tuned_url": tuned_url})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ===========================
-# 4. MIX & MASTER
-# ===========================
-
+# ---------- mix & master ----------
 @app.route("/api/mix-master", methods=["POST"])
 def mix_master():
-    """Mix and master vocals with instrumental."""
+    """
+    Mix and master a vocal file on top of an instrumental.
+    Request JSON:
+      {
+        "vocal_url": "https://...",
+        "instrumental_url": "https://...",
+        "project_id": "optional-id"
+      }
+    """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True)
         vocal_url = data.get("vocal_url")
         instrumental_url = data.get("instrumental_url")
-        project_id = data.get("project_id", str(uuid.uuid4()))
+        project_id = data.get("project_id") or str(uuid.uuid4())
 
         if not vocal_url or not instrumental_url:
-            return jsonify({
-                "success": False,
-                "error": "vocal_url and instrumental_url are required"
-            }), 400
+            return jsonify({"success": False, "error": "vocal_url and instrumental_url are required"}), 400
 
-        # Download files
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp1:
-            download_file(vocal_url, tmp1.name)
-            vocal_path = tmp1.name
+        vocal_path = download_file(vocal_url, suffix=".wav")
+        instrumental_path = download_file(instrumental_url, suffix=".wav")
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp2:
-            download_file(instrumental_url, tmp2.name)
-            instrumental_path = tmp2.name
+        vocals, sr = librosa.load(vocal_path, sr=44100, mono=True)
+        instrumental, _ = librosa.load(instrumental_path, sr=44100, mono=True)
 
-        # Load audio
-        vocals, sr = librosa.load(vocal_path, sr=44100)
-        instrumental, _ = librosa.load(instrumental_path, sr=44100)
-
-        # Match lengths
+        # pad to same length
         max_len = max(len(vocals), len(instrumental))
-        vocals = np.pad(vocals, (0, max_len - len(vocals)))
-        instrumental = np.pad(instrumental, (0, max_len - len(instrumental)))
+        if len(vocals) < max_len:
+            vocals = np.pad(vocals, (0, max_len - len(vocals)))
+        if len(instrumental) < max_len:
+            instrumental = np.pad(instrumental, (0, max_len - len(instrumental)))
 
-        # Simple vocal enhancement
-        vocals_filtered = librosa.effects.preemphasis(vocals, coef=0.97)
-        vocals_enhanced = vocals_filtered + 0.1 * librosa.effects.harmonic(vocals_filtered)
+        # simple mixing: high-pass-ish emphasis on vocals
+        vocals_pre = librosa.effects.preemphasis(vocals, coef=0.97)
+        vocals_enhanced = vocals_pre + 0.1 * librosa.effects.harmonic(vocals_pre)
 
-        # Mix
-        mix = instrumental * 0.8 + vocals_enhanced * 0.7
+        mix = instrumental * 0.85 + vocals_enhanced * 0.9
 
-        # Soft compression
-        threshold = 0.5
-        ratio = 4.0
-        above = np.abs(mix) > threshold
-        mix_compressed = mix.copy()
-        mix_compressed[above] = (
-            np.sign(mix[above])
-            * (threshold + (np.abs(mix[above]) - threshold) / ratio)
-        )
-
-        # Normalize to -1 dB peak
-        peak = np.max(np.abs(mix_compressed)) + 1e-9
-        target_peak = 10 ** (-1.0 / 20.0)
-        mix_normalized = mix_compressed * (target_peak / peak)
-
-        # Limiter at -0.3 dB
-        limit = 10 ** (-0.3 / 20.0)
-        mix_limited = np.clip(mix_normalized, -limit, limit)
+        # soft clip / limiter
+        peak = np.max(np.abs(mix)) + 1e-9
+        target_peak = 10 ** (-1.0 / 20)  # -1 dB
+        mix_norm = mix * (target_peak / peak)
+        limit = 10 ** (-0.3 / 20)
+        mix_limited = np.clip(mix_norm, -limit, limit)
 
         master_url = save_and_get_url(mix_limited, sr, f"{project_id}_master.wav")
 
@@ -281,94 +328,83 @@ def mix_master():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ===========================
-# 5. PLATFORM READINESS CHECK
-# ===========================
-
+# ---------- platform check ----------
 @app.route("/api/platform-check", methods=["POST"])
 def platform_check():
-    """Analyze master for streaming platform compatibility."""
+    """
+    Check loudness / peaks & give feedback for platforms.
+    Request JSON:
+      { "audio_url": "https://..." }
+    """
     try:
-        data = request.json or {}
+        data = request.get_json(force=True)
         audio_url = data.get("audio_url")
-
         if not audio_url:
             return jsonify({"success": False, "error": "audio_url is required"}), 400
 
-        # Download audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            download_file(audio_url, tmp.name)
-            input_path = tmp.name
+        path = download_file(audio_url, suffix=".wav")
 
-        # Load audio
-        y, sr = librosa.load(input_path, sr=44100, mono=False)
-        if y.ndim == 1:
-            y = np.array([y, y])  # make stereo: [2, samples]
-
+        y, sr = sf.read(path, always_2d=True)
+        # y: shape (n_samples, n_channels)
         meter = pyln.Meter(sr)
-        loudness = meter.integrated_loudness(y.T)
+        loudness = meter.integrated_loudness(y)
 
         true_peak = 20 * np.log10(np.max(np.abs(y)) + 1e-10)
 
-        info = sf.info(input_path)
+        info = sf.info(path)
         sample_rate = info.samplerate
-        bit_depth = 16 if "16" in str(info.subtype) else 24
+        # naive bit depth guess
+        subtype = str(info.subtype).lower()
+        if "24" in subtype:
+            bit_depth = 24
+        elif "32" in subtype:
+            bit_depth = 32
+        else:
+            bit_depth = 16
 
         issues = []
 
-        # Spotify
+        # Spotify target roughly -14 LUFS / -1 dBTP
         if loudness < -16:
-            issues.append("Spotify: Too quiet, consider increasing loudness by 2–3 dB")
+            issues.append("Spotify: Track is a bit quiet (under -16 LUFS).")
         elif loudness > -12:
-            issues.append("Spotify: Too loud, will be normalized down")
+            issues.append("Spotify: Track is quite loud and will be turned down.")
         else:
-            issues.append("Spotify: OK")
+            issues.append("Spotify: Loudness is in a good range.")
 
-        # Apple Music
         if true_peak > -1:
-            issues.append("Apple Music: True peak too high, risk of clipping")
+            issues.append("Apple Music: True peak higher than -1 dB, risk of clipping.")
         else:
-            issues.append("Apple Music: OK")
+            issues.append("Apple Music: True peak is safe.")
 
-        # YouTube
-        if loudness < -16:
-            issues.append("YouTube: Slightly quiet but acceptable")
+        if loudness > -13:
+            issues.append("YouTube: Louder than -13 LUFS, will be normalized down.")
         else:
-            issues.append("YouTube: OK")
+            issues.append("YouTube: Loudness is fine.")
 
-        # TikTok
         if loudness > -10:
-            issues.append("TikTok: May sound distorted on mobile speakers")
+            issues.append("TikTok: Might sound a bit squashed on small speakers.")
         else:
-            issues.append("TikTok: OK")
+            issues.append("TikTok: Should translate well on mobile.")
 
-        critical = [i for i in issues if "risk" in i.lower() or "distort" in i.lower()]
+        critical = [i for i in issues if "risk" in i.lower() or "squashed" in i.lower()]
         overall_status = "needs_adjustment" if critical else "ready"
 
-        os.unlink(input_path)
+        os.unlink(path)
 
         return jsonify({
             "success": True,
             "overall_status": overall_status,
             "lufs": round(float(loudness), 1),
             "true_peak": round(float(true_peak), 1),
-            "sample_rate": int(sample_rate),
-            "bit_depth": int(bit_depth),
-            "issues": issues
+            "sample_rate": sample_rate,
+            "bit_depth": bit_depth,
+            "issues": issues,
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# ===========================
-# HEALTH CHECK
-# ===========================
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
