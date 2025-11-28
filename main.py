@@ -1,8 +1,9 @@
 import os
 import uuid
 import tempfile
-import requests
+
 import numpy as np
+import requests
 import librosa
 import soundfile as sf
 import pyloudnorm as pyln
@@ -42,10 +43,9 @@ def save_and_get_url(audio_data: np.ndarray, sr: int, filename: str) -> str:
 
 
 @app.route("/files/<filename>")
-def serve_file(filename):
+def serve_file(filename: str):
     """Serve audio files stored in UPLOAD_FOLDER."""
     from flask import send_from_directory
-
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
@@ -83,13 +83,11 @@ def separate_stems():
 
         os.unlink(input_path)
 
-        return jsonify(
-            {
-                "success": True,
-                "vocals_url": vocals_url,
-                "instrumental_url": instrumental_url,
-            }
-        )
+        return jsonify({
+            "success": True,
+            "vocals_url": vocals_url,
+            "instrumental_url": instrumental_url
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -118,10 +116,7 @@ def analyze_audio():
 
         # BPM detection
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        if hasattr(tempo, "__iter__"):
-            bpm = float(tempo[0])
-        else:
-            bpm = float(tempo)
+        bpm = float(tempo[0]) if hasattr(tempo, "__iter__") else float(tempo)
         bpm = round(bpm)
 
         # Key detection (very simplified)
@@ -151,13 +146,11 @@ def analyze_audio():
 
         os.unlink(input_path)
 
-        return jsonify(
-            {
-                "success": True,
-                "bpm": bpm,
-                "key": key,
-            }
-        )
+        return jsonify({
+            "success": True,
+            "bpm": bpm,
+            "key": key
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -172,7 +165,6 @@ def autotune_vocals():
     try:
         data = request.json or {}
         audio_url = data.get("audio_url")
-        key = data.get("key", "C major")
         style = data.get("style", "medium")  # natural, medium, hard
         project_id = data.get("project_id", str(uuid.uuid4()))
 
@@ -187,13 +179,11 @@ def autotune_vocals():
         # Load audio
         y, sr = librosa.load(input_path, sr=44100)
 
-        # Very simplified "autotune" effect:
-        # For "hard" style we use a more robotic / harmonic effect.
+        # Simple "autotune" flavour:
         if style == "hard":
             y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=0)
             y_tuned = librosa.effects.harmonic(y_shifted)
         else:
-            # For natural/medium, blend processed + dry signal
             y_proc = librosa.effects.pitch_shift(y, sr=sr, n_steps=0)
             strength = {"natural": 0.3, "medium": 0.6}.get(style, 0.6)
             y_tuned = y_proc * strength + y * (1 - strength)
@@ -225,12 +215,10 @@ def mix_master():
         project_id = data.get("project_id", str(uuid.uuid4()))
 
         if not vocal_url or not instrumental_url:
-            return jsonify(
-                {
-                    "success": False,
-                    "error": "vocal_url and instrumental_url are required",
-                }
-            ), 400
+            return jsonify({
+                "success": False,
+                "error": "vocal_url and instrumental_url are required"
+            }), 400
 
         # Download files
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp1:
@@ -250,27 +238,22 @@ def mix_master():
         vocals = np.pad(vocals, (0, max_len - len(vocals)))
         instrumental = np.pad(instrumental, (0, max_len - len(instrumental)))
 
-        # Simple processing chain
-
-        # Pre-emphasis on vocals (remove low rumble)
+        # Pre-emphasis on vocals
         vocals_filtered = librosa.effects.preemphasis(vocals, coef=0.97)
+        # Slight harmonic enhancement
+        vocals_enhanced = vocals_filtered + 0.1 * librosa.effects.harmonic(vocals_filtered)
 
-        # Slight harmonic enhancement for presence
-        vocals_enhanced = vocals_filtered + 0.1 * librosa.effects.harmonic(
-            vocals_filtered
-        )
-
-        # Mix vocals and instrumental
+        # Mix
         mix = instrumental * 0.8 + vocals_enhanced * 0.7
 
-        # Simple soft compression
+        # Soft compression
         threshold = 0.5
         ratio = 4.0
         above = np.abs(mix) > threshold
         mix_compressed = mix.copy()
         mix_compressed[above] = (
-            np.sign(mix[above])
-            * (threshold + (np.abs(mix[above]) - threshold) / ratio)
+            np.sign(mix[above]) *
+            (threshold + (np.abs(mix[above]) - threshold) / ratio)
         )
 
         # Normalize to -1 dB peak
@@ -278,7 +261,7 @@ def mix_master():
         target_peak = 10 ** (-1.0 / 20.0)
         mix_normalized = mix_compressed * (target_peak / peak)
 
-        # Hard limiter at -0.3 dB for safety
+        # Hard limiter at -0.3 dB
         limit = 10 ** (-0.3 / 20.0)
         mix_limited = np.clip(mix_normalized, -limit, limit)
 
@@ -329,9 +312,7 @@ def platform_check():
 
         # Spotify guidelines
         if loudness < -16:
-            issues.append(
-                "Spotify: Too quiet, consider increasing loudness by 2–3 dB"
-            )
+            issues.append("Spotify: Too quiet, consider increasing loudness by 2–3 dB")
         elif loudness > -12:
             issues.append("Spotify: Too loud, will be normalized down")
         else:
@@ -355,24 +336,20 @@ def platform_check():
         else:
             issues.append("TikTok: OK")
 
-        critical = [
-            i for i in issues if "risk" in i.lower() or "distort" in i.lower()
-        ]
+        critical = [i for i in issues if "risk" in i.lower() or "distort" in i.lower()]
         overall_status = "needs_adjustment" if critical else "ready"
 
         os.unlink(input_path)
 
-        return jsonify(
-            {
-                "success": True,
-                "overall_status": overall_status,
-                "lufs": round(float(loudness), 1),
-                "true_peak": round(float(true_peak), 1),
-                "sample_rate": int(sample_rate),
-                "bit_depth": int(bit_depth),
-                "issues": issues,
-            }
-        )
+        return jsonify({
+            "success": True,
+            "overall_status": overall_status,
+            "lufs": round(float(loudness), 1),
+            "true_peak": round(float(true_peak), 1),
+            "sample_rate": int(sample_rate),
+            "bit_depth": int(bit_depth),
+            "issues": issues
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
