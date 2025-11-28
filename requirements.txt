@@ -1,0 +1,10 @@
+flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+spleeter==2.4.0
+librosa==0.10.1
+numpy==1.26.2
+soundfile==0.12.1
+pyloudnorm==0.1.1
+pydub==0.25.1
+requests==2.31.0
