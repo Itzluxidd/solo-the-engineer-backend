@@ -1,8 +1,6 @@
 flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
-
-# Audio / analysis libs
 librosa==0.10.1
 numpy==1.26.2
 soundfile==0.12.1
