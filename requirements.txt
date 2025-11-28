@@ -2,14 +2,12 @@ flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
 
-# Stem separation (we'll let spleeter pull its own compatible librosa)
+# Spleeter for stems – wants librosa==0.8.0
 spleeter==2.1.0
+librosa==0.8.0
 
-# Core audio / DSP tools
 numpy==1.26.2
 soundfile==0.12.1
 pyloudnorm==0.1.1
 pydub==0.25.1
-
-# HTTP client
 requests==2.31.0
