@@ -2,11 +2,9 @@ flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
 
-# Stem separation
+# Stem separation + audio analysis
 spleeter==2.1.0
 librosa==0.8.0
-
-# Audio utils
 soundfile==0.12.1
 pyloudnorm==0.1.1
 pydub==0.25.1
